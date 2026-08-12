@@ -1,0 +1,15 @@
+{
+  "chunk_size": 1024,
+  "qr_size": 600,
+  "qr_border": 4,
+  "shuffle_enabled": true,
+  "send_fps": 5.0,
+  "capture_source": "screen",
+  "camera_index": 0,
+  "camera_width": 1280,
+  "camera_height": 720,
+  "capture_fps": 15.0,
+  "monitor_index": 1,
+  "output_dir": "",
+  "language": "zh_CN"
+}
