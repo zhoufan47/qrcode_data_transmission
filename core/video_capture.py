@@ -173,6 +173,18 @@ class ScreenCapture(VideoCaptureBase):
         try:
             import mss
             self._sct = mss.mss()
+            try:
+                idx = self.monitor_index
+                monitors = self._sct.monitors
+                if 0 <= idx < len(monitors):
+                    m = monitors[idx]
+                    print(f"屏幕捕获已初始化: 显示器[{idx}] "
+                          f"({m['left']},{m['top']}) {m['width']}x{m['height']}")
+                else:
+                    print(f"屏幕捕获已初始化: 显示器索引[{idx}]超出范围 "
+                          f"(共{len(monitors) - 1}个显示器)")
+            except Exception:
+                pass
             return True
         except ImportError:
             if self.on_error:

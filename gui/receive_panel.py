@@ -312,6 +312,9 @@ class ReceivePanel(QWidget):
 
         self.lbl_status.setText("状态: 采集中...")
 
+        # 重置分辨率显示标记
+        self._frame_res_shown = False
+
         # 重置解码器
         self.decoder.reset()
         self._last_decoded_texts.clear()
@@ -375,7 +378,10 @@ class ReceivePanel(QWidget):
             if len(self._last_decoded_texts) > 50:
                 self._last_decoded_texts.clear()
 
-            self.decoder.process_frame_data(text)
+            tid = self.decoder.process_frame_data(text)
+            if tid is None and text.startswith("DATA|"):
+                # DATA先于META到达，已暂存等待META重放
+                print(f"[接收] DATA帧已解出但META未到达，已暂存: {text[:40]}...")
 
     def _on_capture_error(self, error_msg: str):
         print(f"采集错误: {error_msg}")
@@ -386,6 +392,13 @@ class ReceivePanel(QWidget):
             return
 
         frame = self._latest_frame.copy()
+
+        # 首帧时记录实际接收分辨率（解码用原图，仅预览缩放）
+        if not getattr(self, "_frame_res_shown", False):
+            self._frame_res_shown = True
+            src_h, src_w = frame.shape[:2]
+            print(f"实际接收帧分辨率: {src_w}x{src_h}（预览按比例缩放显示，解码使用原图）")
+            self.lbl_status.setText(f"状态: 采集中... (实际采集 {src_w}x{src_h})")
 
         # 绘制QR码检测框（如果有）
         try:
@@ -403,7 +416,9 @@ class ReceivePanel(QWidget):
         display_h = self.video_label.height()
         scale = min(display_w / w, display_h / h, 1.0)
         new_w, new_h = int(w * scale), int(h * scale)
-        frame = cv2.resize(frame, (new_w, new_h))
+        # 缩小时用INTER_AREA重采样，预览更清晰
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=interp)
 
         # 转换为QPixmap
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)

@@ -329,11 +329,15 @@ class SendPanel(QWidget):
         if self.config.shuffle_enabled:
             self.shuffled_playlist = self._build_dynamic_shuffled_playlist()
         else:
-            self.shuffled_playlist = (
-                [self.current_encode.meta_entry]
-                + list(self.current_encode.data_entries)
-                + [self.current_encode.end_entry]
-            )
+            # 顺序模式同样周期性重发META，避免接收方漏掉首个META后永远卡住
+            playlist: List[QREntry] = []
+            data_entries = list(self.current_encode.data_entries)
+            rounds = max(3, min(8, 200 // max(len(data_entries), 1) + 2))
+            for _ in range(rounds):
+                playlist.append(self.current_encode.meta_entry)
+                playlist.extend(data_entries)
+            playlist.append(self.current_encode.end_entry)
+            self.shuffled_playlist = playlist
 
         # 移除队列列表中的第一项
         if self.queue_list.count() > 0:
@@ -354,16 +358,21 @@ class SendPanel(QWidget):
         self._start_qr_timer()
 
     def _build_dynamic_shuffled_playlist(self) -> List[QREntry]:
-        """构建动态乱序播放列表（meta + 多轮乱序data + end）"""
+        """构建动态乱序播放列表（每轮乱序DATA前都插入META + 末尾END）
+
+        META帧周期性重发，确保中途开始接收或漏掉首帧META的
+        接收方仍能建立传输会话，避免卡在"等待接收"状态。
+        """
         if self.current_encode is None:
             return []
 
-        playlist = [self.current_encode.meta_entry]
+        playlist: List[QREntry] = []
 
         # 多轮乱序：保证每轮都是完整的，覆盖所有chunk
         data_entries = list(self.current_encode.data_entries)
         rounds = max(3, min(8, 200 // max(len(data_entries), 1) + 2))
         for _ in range(rounds):
+            playlist.append(self.current_encode.meta_entry)
             shuffled = list(data_entries)
             random.shuffle(shuffled)
             playlist.extend(shuffled)

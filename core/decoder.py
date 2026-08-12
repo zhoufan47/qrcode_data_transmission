@@ -77,6 +77,9 @@ class QRDecoder:
         self.transfers: Dict[str, TransferProgress] = {}
         self._lock = threading.Lock()
 
+        # 孤儿DATA帧缓存：DATA早于META到达时暂存，META到达后重放
+        self._orphan_data: Dict[str, list] = {}
+
         # 回调
         self.on_progress: Optional[Callable[[str, TransferProgress], None]] = None
         self.on_complete: Optional[Callable[[str, TransferProgress, str], None]] = None
@@ -149,7 +152,7 @@ class QRDecoder:
             if meta.transfer_id in self.transfers:
                 # 已存在的传输，可能重复的META帧
                 return meta.transfer_id
-
+            
             progress = TransferProgress(
                 transfer_id=meta.transfer_id,
                 filename=meta.filename,
@@ -161,9 +164,16 @@ class QRDecoder:
                 start_time=time.time(),
             )
             self.transfers[meta.transfer_id] = progress
+            
+            # 取出早于META到达的孤儿DATA帧，稍后重放
+            orphans = self._orphan_data.pop(meta.transfer_id, [])
 
         if self.on_new_transfer:
             self.on_new_transfer(meta.transfer_id, progress)
+
+        # 重放孤儿DATA帧
+        for orphan in orphans:
+            self._handle_data(orphan)
 
         return meta.transfer_id
 
@@ -173,6 +183,10 @@ class QRDecoder:
 
         with self._lock:
             if tid not in self.transfers:
+                # META尚未到达：暂存该DATA帧，等META到达后自动重放
+                orphans = self._orphan_data.setdefault(tid, [])
+                if len(orphans) < 2000:
+                    orphans.append(data)
                 return None
 
             progress = self.transfers[tid]
@@ -293,3 +307,4 @@ class QRDecoder:
     def reset(self):
         with self._lock:
             self.transfers.clear()
+            self._orphan_data.clear()
