@@ -1,5 +1,5 @@
 {
-  "chunk_size": 1024,
+  "chunk_size": 768,
   "qr_size": 600,
   "qr_border": 4,
   "shuffle_enabled": true,

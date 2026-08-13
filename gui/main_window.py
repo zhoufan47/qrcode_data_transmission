@@ -31,8 +31,8 @@ class MainWindow(QMainWindow):
 
         # 窗口设置
         self.setWindowTitle("QR码数据摆渡系统")
-        self.resize(1200, 800)
-        self.setMinimumSize(900, 600)
+        self.resize(1400, 900)
+        self.setMinimumSize(960, 640)
 
         # 创建标签页
         self.tab_widget = QTabWidget()

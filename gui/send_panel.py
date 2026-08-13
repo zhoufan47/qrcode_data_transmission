@@ -59,6 +59,9 @@ class SendPanel(QWidget):
         self.current_task_id: Optional[str] = None
         self.current_transfer_id: Optional[str] = None
 
+        # 全屏放大显示窗口（懒创建）
+        self.fullscreen_view: Optional["QRFullscreenView"] = None
+
         self._init_ui()
 
     def _init_ui(self):
@@ -73,7 +76,8 @@ class SendPanel(QWidget):
 
         # 队列列表
         self.queue_list = QListWidget()
-        self.queue_list.setMinimumHeight(150)
+        self.queue_list.setMinimumHeight(110)
+        self.queue_list.setMaximumHeight(160)
         self.queue_list.setAlternatingRowColors(True)
         queue_layout.addWidget(self.queue_list)
 
@@ -203,7 +207,8 @@ class SendPanel(QWidget):
         # 左侧容器
         left_widget = QWidget()
         left_widget.setLayout(left_panel)
-        left_widget.setMaximumWidth(380)
+        left_widget.setMinimumWidth(280)
+        left_widget.setMaximumWidth(320)
 
         # === 右侧QR码显示 ===
         right_panel = QVBoxLayout()
@@ -218,12 +223,13 @@ class SendPanel(QWidget):
         for i in range(6):
             label = QLabel()
             label.setAlignment(Qt.AlignCenter)
-            label.setMinimumSize(180, 180)
+            label.setMinimumSize(220, 220)
             label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             label.setStyleSheet(
-                "background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 4px;"
+                "background-color: #ffffff; border: 1px solid #bbb; border-radius: 4px;"
             )
             label.setText("等待发送文件...")
+            label.setContentsMargins(2, 2, 2, 2)
             self.qr_labels.append(label)
             row, col = divmod(i, 2)
             self.qr_grid.addWidget(label, row, col)
@@ -234,9 +240,16 @@ class SendPanel(QWidget):
         qr_display_layout.addLayout(self.qr_grid)
         self._update_qr_grid(self.config.qr_display_count)
 
+        # 下方信息栏 + 全屏按钮
+        info_row = QHBoxLayout()
         self.lbl_qr_info = QLabel("")
         self.lbl_qr_info.setAlignment(Qt.AlignCenter)
-        qr_display_layout.addWidget(self.lbl_qr_info)
+        info_row.addWidget(self.lbl_qr_info, 1)
+        self.btn_fullscreen = QPushButton("🔍 全屏放大显示")
+        self.btn_fullscreen.setToolTip("在新窗口中以更大尺寸显示当前二维码，便于识别")
+        self.btn_fullscreen.clicked.connect(self._open_fullscreen_view)
+        info_row.addWidget(self.btn_fullscreen)
+        qr_display_layout.addLayout(info_row)
 
         qr_display_group.setLayout(qr_display_layout)
         right_panel.addWidget(qr_display_group)
@@ -549,6 +562,10 @@ class SendPanel(QWidget):
             if entry.chunk_index >= 0:
                 self.shown_chunks.add(entry.chunk_index)
 
+        # 同步更新全屏放大窗口（如果已打开）
+        if self.fullscreen_view is not None and self.fullscreen_view.isVisible():
+            self.fullscreen_view.update_batch(entries, images)
+
         # 更新进度（按已覆盖的唯一chunk数）
         covered = len(self.shown_chunks)
         self.progress_bar.setValue(min(covered, self.current_encode.total_chunks))
@@ -568,16 +585,42 @@ class SendPanel(QWidget):
                 types.append(f"#{entry.chunk_index + 1}")
         self.lbl_qr_info.setText(f"同显 {count} 张: {' | '.join(types)}")
 
+    def _open_fullscreen_view(self):
+        """打开全屏放大显示窗口"""
+        if not self.is_sending:
+            QMessageBox.information(self, "提示", "请先开始发送文件后再使用全屏显示")
+            return
+        if self.fullscreen_view is None:
+            self.fullscreen_view = QRFullscreenView(self)
+        self.fullscreen_view.show()
+        self.fullscreen_view.raise_()
+        self.fullscreen_view.activateWindow()
+        # 立即同步当前批次
+        latest = None
+        if self.ready_queue is not None:
+            while True:
+                try:
+                    latest = self.ready_queue.get_nowait()
+                except queue.Empty:
+                    break
+        if latest is not None:
+            self.fullscreen_view.update_batch(latest[0], latest[1])
+
     def _set_label_pixmap(self, label: QLabel, img: Image.Image):
-        """将PIL图像显示到label（缩放适配）"""
+        """将PIL图像显示到label（缩放适配）
+
+        优化：去掉内边距、使用 FastTransformation 保持黑白色块锐利。
+        """
+        # 几乎填满 label，保留 2px 视觉间距
         avail = label.size()
-        w = max(120, avail.width() - 10)
-        h = max(120, avail.height() - 10)
+        w = max(160, avail.width() - 4)
+        h = max(160, avail.height() - 4)
 
         data = img.tobytes("raw", "RGB")
         qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+        # QR码是黑白块状图形，用最近邻缩放最锐利、最快
         pixmap = QPixmap.fromImage(qimage).scaled(
-            w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+            w, h, Qt.KeepAspectRatio, Qt.FastTransformation
         )
         label.setPixmap(pixmap)
 
@@ -641,6 +684,10 @@ class SendPanel(QWidget):
         # 停止QR生成线程
         self._stop_qr_gen_thread()
 
+        # 关闭全屏视图
+        if self.fullscreen_view is not None:
+            self.fullscreen_view.close()
+
         self.btn_add_files.setEnabled(True)
         self.btn_remove_file.setEnabled(True)
         self.btn_clear_queue.setEnabled(True)
@@ -669,6 +716,10 @@ class SendPanel(QWidget):
         # 停止QR生成线程
         self._stop_qr_gen_thread()
 
+        # 关闭全屏视图
+        if self.fullscreen_view is not None:
+            self.fullscreen_view.close()
+
         self.btn_add_files.setEnabled(True)
         self.btn_remove_file.setEnabled(True)
         self.btn_clear_queue.setEnabled(True)
@@ -696,3 +747,158 @@ class SendPanel(QWidget):
             return f"{size / (1024 * 1024):.2f} MB"
         else:
             return f"{size / (1024 * 1024 * 1024):.2f} GB"
+
+
+class QRFullscreenView(QWidget):
+    """QR码全屏放大显示窗口
+
+    以独立大窗口显示当前批次的二维码（1/2/4/6张同显），便于接收端
+    摄像头清晰识别。窗口实时跟随发送面板的批次切换。
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent, Qt.Window)
+        self.setWindowTitle("QR码全屏放大显示 - 用于接收端识别")
+        self.setStyleSheet("background-color: #1e1e1e; color: #eee;")
+        # 开启该窗口后，Enter进入全屏、Esc退出
+        self._fullscreen = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
+
+        # 顶部提示栏
+        top_row = QHBoxLayout()
+        hint = QLabel("提示：按 F 进入/退出全屏，Esc 关闭此窗口")
+        hint.setStyleSheet("color: #ccc; font-size: 13px;")
+        top_row.addWidget(hint)
+        top_row.addStretch()
+        self.btn_toggle_fs = QPushButton("⛶ 全屏切换 (F)")
+        self.btn_toggle_fs.clicked.connect(self._toggle_fullscreen)
+        top_row.addWidget(self.btn_toggle_fs)
+        self.btn_close = QPushButton("关闭 (Esc)")
+        self.btn_close.clicked.connect(self.close)
+        top_row.addWidget(self.btn_close)
+        outer.addLayout(top_row)
+
+        # 网格容器，动态适配 1/2/4/6 张
+        self.grid = QGridLayout()
+        self.grid.setSpacing(8)
+        outer.addLayout(self.grid, 1)
+
+        # 预创建 6 个 label
+        self.labels: List[QLabel] = []
+        for i in range(6):
+            label = QLabel()
+            label.setAlignment(Qt.AlignCenter)
+            label.setMinimumSize(160, 160)
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            label.setStyleSheet(
+                "background-color: #ffffff; border: 1px solid #888; border-radius: 4px;"
+            )
+            label.setText("等待批次...")
+            self.labels.append(label)
+            row, col = divmod(i, 2)
+            self.grid.addWidget(label, row, col)
+        for c in range(2):
+            self.grid.setColumnStretch(c, 1)
+        for r in range(3):
+            self.grid.setRowStretch(r, 1)
+
+        # 底部信息
+        self.lbl_info = QLabel("")
+        self.lbl_info.setAlignment(Qt.AlignCenter)
+        self.lbl_info.setStyleSheet("color: #ccc; font-size: 13px;")
+        outer.addWidget(self.lbl_info)
+
+        # 初始尺寸
+        self.resize(1100, 760)
+
+    def _toggle_fullscreen(self):
+        if self._fullscreen:
+            self.showNormal()
+            self._fullscreen = False
+        else:
+            self.showFullScreen()
+            self._fullscreen = True
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_F:
+            self._toggle_fullscreen()
+        elif event.key() == Qt.Key_Escape:
+            if self._fullscreen:
+                self._toggle_fullscreen()
+            else:
+                self.close()
+        else:
+            super().keyPressEvent(event)
+
+    def update_batch(self, entries: List[QREntry], images: List[Image.Image]):
+        """被发送面板调用，同步当前批次"""
+        count = len(images)
+        # 重新布局网格（位置+stretch）
+        self._relayout(count)
+        # 隐藏多余 label
+        for i, label in enumerate(self.labels):
+            label.setVisible(i < count)
+        # 显示二维码
+        for i, (entry, img) in enumerate(zip(entries, images)):
+            if i >= len(self.labels):
+                break
+            self._set_label_pixmap(self.labels[i], img)
+        # 更新帧信息
+        types = []
+        for entry in entries:
+            if entry.chunk_index == -1:
+                types.append("META")
+            elif entry.chunk_index == -2:
+                types.append("END")
+            else:
+                types.append(f"#{entry.chunk_index + 1}")
+        self.lbl_info.setText(f"同显 {count} 张: {' | '.join(types)}")
+
+    def _relayout(self, count: int):
+        """根据数量调整网格行列，并把 label 重新放到合适位置
+
+        单张时跨满整行，多张时仍按 2×3 网格排列。重新 addWidget 后
+        QWidget 默认可见，必须显式 setVisible 控制。
+        """
+        # 先移除所有 label
+        for label in self.labels:
+            self.grid.removeWidget(label)
+        # 重置 stretch
+        for c in range(2):
+            self.grid.setColumnStretch(c, 0)
+        for r in range(3):
+            self.grid.setRowStretch(r, 0)
+        # 1张：1行跨2列；2张：1行2列；4张：2行2列；6张：2行3列
+        if count == 1:
+            self.grid.addWidget(self.labels[0], 0, 0, 1, 2)
+            self.grid.setColumnStretch(0, 1)
+            self.grid.setColumnStretch(1, 1)
+            self.grid.setRowStretch(0, 1)
+        else:
+            cols = 2
+            rows = (count + cols - 1) // cols
+            for c in range(cols):
+                self.grid.setColumnStretch(c, 1)
+            for r in range(rows):
+                self.grid.setRowStretch(r, 1)
+            for i in range(count):
+                r, c = divmod(i, cols)
+                self.grid.addWidget(self.labels[i], r, c)
+        # 控制可见性
+        for i, label in enumerate(self.labels):
+            label.setVisible(i < count)
+
+    def _set_label_pixmap(self, label: QLabel, img: Image.Image):
+        """将PIL图像缩放填满label"""
+        avail = label.size()
+        w = max(200, avail.width() - 4)
+        h = max(200, avail.height() - 4)
+        data = img.tobytes("raw", "RGB")
+        qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimage).scaled(
+            w, h, Qt.KeepAspectRatio, Qt.FastTransformation
+        )
+        label.setPixmap(pixmap)
