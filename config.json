@@ -4,6 +4,7 @@
   "qr_border": 4,
   "shuffle_enabled": true,
   "send_fps": 5.0,
+  "qr_display_count": 4,
   "capture_source": "screen",
   "camera_index": 0,
   "camera_width": 1280,

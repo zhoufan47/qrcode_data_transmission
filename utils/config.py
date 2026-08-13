@@ -18,6 +18,7 @@ class AppConfig:
     qr_border: int = 4
     shuffle_enabled: bool = True
     send_fps: float = 5.0  # 发送端QR码切换帧率
+    qr_display_count: int = 1  # 同屏显示的QR码数量 (1/2/4/6)
 
     # 接收设置
     capture_source: str = "camera"  # "camera" 或 "screen"

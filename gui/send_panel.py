@@ -3,20 +3,23 @@
 """
 
 import os
+import queue
 import random
 import threading
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Set
 
 from PySide6.QtCore import Qt, QTimer, Signal, QSize
 from PySide6.QtGui import QPixmap, QImage, QFont
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QListWidget, QListWidgetItem, QGroupBox, QSpinBox, QDoubleSpinBox,
     QCheckBox, QFileDialog, QProgressBar, QSplitter, QFrame,
-    QMessageBox, QSizePolicy,
+    QMessageBox, QSizePolicy, QComboBox,
 )
+
+from PIL import Image
 
 from core.encoder import FileEncoder, EncodeResult, QREntry
 from utils.config import ConfigManager
@@ -37,11 +40,20 @@ class SendPanel(QWidget):
         # 发送队列
         self.queue: List[EncodeResult] = []
         self.current_encode: Optional[EncodeResult] = None
+        self.current_encoder: Optional[FileEncoder] = None
         self.current_qr_index: int = 0
         self.shuffled_playlist: List[QREntry] = []
+        self.shown_chunks: Set[int] = set()
         self.is_sending: bool = False
         self.send_timer: Optional[QTimer] = None
         self.send_thread: Optional[threading.Thread] = None
+
+        # QR图像后台实时生成
+        self.qr_gen_thread: Optional[threading.Thread] = None
+        self._gen_running: bool = False
+        self.gen_queue: Optional[queue.Queue] = None    # 待生成批次
+        self.ready_queue: Optional[queue.Queue] = None  # 已生成批次
+        self.batch_counter: int = 0
 
         # 任务跟踪
         self.current_task_id: Optional[str] = None
@@ -171,6 +183,18 @@ class SendPanel(QWidget):
         self.chk_shuffle.toggled.connect(self._on_shuffle_changed)
         settings_layout.addWidget(self.chk_shuffle)
 
+        # 同显QR数量设置
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("同显QR数量:"))
+        self.combo_qr_count = QComboBox()
+        self.combo_qr_count.addItems(["1", "2", "4", "6"])
+        self.combo_qr_count.setCurrentText(str(self.config.qr_display_count))
+        self.combo_qr_count.currentTextChanged.connect(self._on_display_count_changed)
+        row4.addWidget(self.combo_qr_count)
+        row4.addWidget(QLabel("张"))
+        row4.addStretch()
+        settings_layout.addLayout(row4)
+
         settings_group.setLayout(settings_layout)
         left_panel.addWidget(settings_group)
 
@@ -187,13 +211,28 @@ class SendPanel(QWidget):
         qr_display_group = QGroupBox("QR码预览")
         qr_display_layout = QVBoxLayout()
 
-        self.qr_label = QLabel()
-        self.qr_label.setAlignment(Qt.AlignCenter)
-        self.qr_label.setMinimumSize(400, 400)
-        self.qr_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.qr_label.setStyleSheet("background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 4px;")
-        self.qr_label.setText("等待发送文件...")
-        qr_display_layout.addWidget(self.qr_label)
+        # 网格布局：支持 1/2/4/6 张QR码同时显示
+        self.qr_grid = QGridLayout()
+        self.qr_grid.setSpacing(6)
+        self.qr_labels: List[QLabel] = []
+        for i in range(6):
+            label = QLabel()
+            label.setAlignment(Qt.AlignCenter)
+            label.setMinimumSize(180, 180)
+            label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            label.setStyleSheet(
+                "background-color: #f0f0f0; border: 1px solid #ccc; border-radius: 4px;"
+            )
+            label.setText("等待发送文件...")
+            self.qr_labels.append(label)
+            row, col = divmod(i, 2)
+            self.qr_grid.addWidget(label, row, col)
+        for c in range(2):
+            self.qr_grid.setColumnStretch(c, 1)
+        for r in range(3):
+            self.qr_grid.setRowStretch(r, 1)
+        qr_display_layout.addLayout(self.qr_grid)
+        self._update_qr_grid(self.config.qr_display_count)
 
         self.lbl_qr_info = QLabel("")
         self.lbl_qr_info.setAlignment(Qt.AlignCenter)
@@ -258,12 +297,30 @@ class SendPanel(QWidget):
     def _on_shuffle_changed(self, checked):
         self.config_manager.update(shuffle_enabled=checked)
 
+    def _on_display_count_changed(self, text: str):
+        """同显QR数量变更"""
+        count = int(text)
+        self.config_manager.update(qr_display_count=count)
+        self._update_qr_grid(count)
+
+    def _update_qr_grid(self, count: int):
+        """更新网格显示数量"""
+        for i, label in enumerate(self.qr_labels):
+            label.setVisible(i < count)
+
+    def _clear_qr_labels(self, text: str = "等待发送文件..."):
+        """清空所有QR显示label"""
+        for label in self.qr_labels:
+            label.clear()
+            label.setText(text)
+        self._update_qr_grid(self.config.qr_display_count)
+
     # ========== 发送逻辑 ==========
 
     def _encode_queue_files(self) -> bool:
-        """编码队列中的所有文件"""
+        """编码队列中的所有文件（仅切片+预编码帧数据，不生成QR图像）"""
         self.queue.clear()
-        encoder = FileEncoder(
+        self.current_encoder = FileEncoder(
             chunk_size=self.config.chunk_size,
             qr_size=self.config.qr_size,
             qr_border=self.config.qr_border,
@@ -276,7 +333,7 @@ class SendPanel(QWidget):
             transfer_id = uuid.uuid4().hex[:12]
 
             try:
-                result = encoder.encode_file(filepath, transfer_id=transfer_id)
+                result = self.current_encoder.encode_file(filepath, transfer_id=transfer_id)
                 self.queue.append(result)
             except Exception as e:
                 QMessageBox.warning(self, "编码失败", f"文件 {os.path.basename(filepath)} 编码失败:\n{str(e)}")
@@ -313,6 +370,7 @@ class SendPanel(QWidget):
 
         self.current_encode = self.queue.pop(0)
         self.current_qr_index = 0
+        self.shown_chunks.clear()
         self.current_transfer_id = self.current_encode.transfer_id
         self.current_task_id = uuid.uuid4().hex[:12]
 
@@ -355,7 +413,173 @@ class SendPanel(QWidget):
 
         # 启动发送定时器
         self.btn_next_file.setEnabled(True)
+        self._start_qr_gen_thread()
         self._start_qr_timer()
+
+    def _start_qr_timer(self):
+        """启动QR码切换定时器"""
+        if self.send_timer is not None:
+            self.send_timer.stop()
+
+        interval = int(1000 / self.config.send_fps)
+        self.send_timer = QTimer(self)
+        self.send_timer.timeout.connect(self._show_next_batch)
+        self.send_timer.start(interval)
+
+        # 预请求两批供后台生成，并同步生成第一批立即显示
+        self._request_next_batch()
+        self._request_next_batch()
+        self._show_next_batch(sync_fallback=True)
+
+    # ========== QR实时生成与批次显示 ==========
+
+    def _start_qr_gen_thread(self):
+        """启动后台QR图像生成线程"""
+        self._stop_qr_gen_thread()
+        self._gen_running = True
+        self.gen_queue = queue.Queue(maxsize=4)
+        self.ready_queue = queue.Queue()
+        self.qr_gen_thread = threading.Thread(target=self._qr_gen_worker, daemon=True)
+        self.qr_gen_thread.start()
+
+    def _qr_gen_worker(self):
+        """后台线程：将帧数据实时生成为QR图像"""
+        # 使用局部引用避免停止时主线程置None造成竞态
+        gen_queue = self.gen_queue
+        ready_queue = self.ready_queue
+        encoder = self.current_encoder
+        while self._gen_running:
+            try:
+                entries = gen_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if entries is None:
+                break
+            if encoder is None:
+                continue
+            try:
+                images = [encoder.make_qr(e.frame_data) for e in entries]
+            except Exception:
+                continue
+            if not self._gen_running:
+                break
+            try:
+                ready_queue.put((entries, images))
+            except Exception:
+                pass
+
+    def _stop_qr_gen_thread(self):
+        """停止后台QR图像生成线程"""
+        self._gen_running = False
+        if self.qr_gen_thread is not None and self.qr_gen_thread.is_alive():
+            try:
+                if self.gen_queue is not None:
+                    self.gen_queue.put_nowait(None)
+            except queue.Full:
+                pass
+            self.qr_gen_thread.join(timeout=1.0)
+        self.qr_gen_thread = None
+        self.gen_queue = None
+        self.ready_queue = None
+
+    def _take_entries(self) -> List[QREntry]:
+        """从播放列表取下一批帧（循环播放）"""
+        entries: List[QREntry] = []
+        count = self.config.qr_display_count
+        for _ in range(count):
+            if not self.shuffled_playlist:
+                break
+            if self.current_qr_index >= len(self.shuffled_playlist):
+                self.current_qr_index = 0
+            entries.append(self.shuffled_playlist[self.current_qr_index])
+            self.current_qr_index += 1
+        return entries
+
+    def _request_next_batch(self):
+        """将下一批帧交给后台线程生成QR图像"""
+        if not self._gen_running or self.gen_queue is None:
+            return
+        entries = self._take_entries()
+        if not entries:
+            return
+        try:
+            self.gen_queue.put_nowait(entries)
+        except queue.Full:
+            pass
+
+    def _show_next_batch(self, sync_fallback: bool = False):
+        """显示最新一批就绪的QR码，并请求后台生成下一批"""
+        if not self.is_sending or self.current_encode is None:
+            return
+        if not self.shuffled_playlist:
+            return
+
+        # 取最新的就绪批次
+        latest = None
+        while True:
+            try:
+                latest = self.ready_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest is not None:
+            self._display_batch(latest)
+        elif sync_fallback:
+            # 启动瞬间同步生成第一批，保证立即有画面
+            entries = self._take_entries()
+            if entries and self.current_encoder is not None:
+                images = [self.current_encoder.make_qr(e.frame_data) for e in entries]
+                self._display_batch((entries, images))
+
+        # 请求后台生成下一批
+        self._request_next_batch()
+
+    def _display_batch(self, batch):
+        """显示一批QR码图像"""
+        entries, images = batch
+        count = len(images)
+
+        for i, label in enumerate(self.qr_labels):
+            label.setVisible(i < count)
+
+        for i, (entry, img) in enumerate(zip(entries, images)):
+            if i >= len(self.qr_labels):
+                break
+            self._set_label_pixmap(self.qr_labels[i], img)
+            if entry.chunk_index >= 0:
+                self.shown_chunks.add(entry.chunk_index)
+
+        # 更新进度（按已覆盖的唯一chunk数）
+        covered = len(self.shown_chunks)
+        self.progress_bar.setValue(min(covered, self.current_encode.total_chunks))
+        self.lbl_progress_detail.setText(
+            f"已覆盖 {covered}/{self.current_encode.total_chunks} chunks · "
+            f"播放位置 {self.current_qr_index}/{len(self.shuffled_playlist)}"
+        )
+
+        # 帧类型信息
+        types = []
+        for entry in entries:
+            if entry.chunk_index == -1:
+                types.append("META")
+            elif entry.chunk_index == -2:
+                types.append("END")
+            else:
+                types.append(f"#{entry.chunk_index + 1}")
+        self.lbl_qr_info.setText(f"同显 {count} 张: {' | '.join(types)}")
+
+    def _set_label_pixmap(self, label: QLabel, img: Image.Image):
+        """将PIL图像显示到label（缩放适配）"""
+        avail = label.size()
+        w = max(120, avail.width() - 10)
+        h = max(120, avail.height() - 10)
+
+        data = img.tobytes("raw", "RGB")
+        qimage = QImage(data, img.width, img.height, img.width * 3, QImage.Format_RGB888)
+        pixmap = QPixmap.fromImage(qimage).scaled(
+            w, h, Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
+        label.setPixmap(pixmap)
 
     def _build_dynamic_shuffled_playlist(self) -> List[QREntry]:
         """构建动态乱序播放列表（每轮乱序DATA前都插入META + 末尾END）
@@ -380,72 +604,6 @@ class SendPanel(QWidget):
         playlist.append(self.current_encode.end_entry)
         return playlist
 
-    def _start_qr_timer(self):
-        """启动QR码切换定时器"""
-        if self.send_timer is not None:
-            self.send_timer.stop()
-
-        interval = int(1000 / self.config.send_fps)
-        self.send_timer = QTimer(self)
-        self.send_timer.timeout.connect(self._show_next_qr)
-        self.send_timer.start(interval)
-
-        # 立即显示第一个
-        self._show_next_qr()
-
-    def _show_next_qr(self):
-        """切换到下一个QR码"""
-        if not self.is_sending or self.current_encode is None:
-            return
-
-        if not self.shuffled_playlist:
-            return
-
-        # 循环播放
-        if self.current_qr_index >= len(self.shuffled_playlist):
-            self.current_qr_index = 0
-
-        entry = self.shuffled_playlist[self.current_qr_index]
-        self._display_qr(entry)
-
-        # 更新进度（仅统计DATA帧）
-        if entry.chunk_index >= 0:
-            self.progress_bar.setValue(entry.chunk_index + 1)
-            self.lbl_progress_detail.setText(
-                f"帧 {self.current_qr_index + 1} / {len(self.shuffled_playlist)}  "
-                f"(chunk {entry.chunk_index + 1}/{self.current_encode.total_chunks})"
-            )
-
-        self.current_qr_index += 1
-
-    def _display_qr(self, entry: QREntry):
-        """显示QR码图像"""
-        img = entry.qr_image
-
-        # 缩放以适应显示区域
-        available_size = self.qr_label.size()
-        display_size = min(available_size.width(), available_size.height()) - 20
-        display_size = max(200, display_size)
-
-        scaled = img.resize((display_size, display_size))
-
-        # 转换为QPixmap
-        data = scaled.tobytes("raw", "RGB")
-        qimage = QImage(data, scaled.width, scaled.height, scaled.width * 3, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimage)
-
-        self.qr_label.setPixmap(pixmap)
-
-        # 帧信息
-        if entry.chunk_index == -1:
-            self.lbl_qr_info.setText("📋 元数据帧")
-        elif entry.chunk_index == -2:
-            self.lbl_qr_info.setText("🏁 结束帧")
-        else:
-            self.lbl_qr_info.setText(
-                f"📦 数据帧 (chunk {entry.chunk_index + 1}/{self.current_encode.total_chunks})"
-            )
-
     def _confirm_next(self):
         """确认当前文件接收完成，发送下一个"""
         if not self.is_sending or self.current_encode is None:
@@ -454,6 +612,9 @@ class SendPanel(QWidget):
         # 停止当前发送计时器
         if self.send_timer:
             self.send_timer.stop()
+
+        # 停止QR生成线程
+        self._stop_qr_gen_thread()
 
         # 记录完成任务
         task_id = self.current_task_id
@@ -477,6 +638,9 @@ class SendPanel(QWidget):
             self.send_timer.stop()
             self.send_timer = None
 
+        # 停止QR生成线程
+        self._stop_qr_gen_thread()
+
         self.btn_add_files.setEnabled(True)
         self.btn_remove_file.setEnabled(True)
         self.btn_clear_queue.setEnabled(True)
@@ -487,12 +651,13 @@ class SendPanel(QWidget):
         self.lbl_current_file.setText("当前文件: 无")
         self.progress_bar.setValue(0)
         self.lbl_progress_detail.setText("")
-        self.qr_label.clear()
-        self.qr_label.setText("等待发送文件...")
+        self._clear_qr_labels("等待发送文件...")
         self.lbl_qr_info.setText("")
 
         self.current_encode = None
+        self.current_encoder = None
         self.shuffled_playlist.clear()
+        self.shown_chunks.clear()
 
     def _on_queue_complete(self):
         """队列发送完成"""
@@ -500,6 +665,9 @@ class SendPanel(QWidget):
         if self.send_timer:
             self.send_timer.stop()
             self.send_timer = None
+
+        # 停止QR生成线程
+        self._stop_qr_gen_thread()
 
         self.btn_add_files.setEnabled(True)
         self.btn_remove_file.setEnabled(True)
@@ -510,9 +678,9 @@ class SendPanel(QWidget):
 
         self.lbl_current_file.setText("当前文件: 全部发送完成 ✓")
         self.lbl_progress_detail.setText("队列已发完")
-        self.qr_label.clear()
-        self.qr_label.setText("全部发送完成！")
+        self._clear_qr_labels("全部发送完成！")
         self.lbl_qr_info.setText("")
+        self.shown_chunks.clear()
 
         QMessageBox.information(self, "完成", "队列中所有文件已发送完成！")
 
